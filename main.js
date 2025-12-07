@@ -1,14 +1,16 @@
+require('dotenv').config();
 const { program } = require('commander');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJSDoc = require('swagger-jsdoc');
+const { Client } = require('pg');
 
 program
-  .requiredOption('-h, --host <type>', 'адреса сервера')
-  .requiredOption('-p, --port <type>', 'порт сервера')
-  .requiredOption('-c, --cache <type>', 'шлях до директорії кешу');
+  .requiredOption('-h, --host <type>', 'адреса сервера', process.env.HOST || '0.0.0.0')
+  .requiredOption('-p, --port <type>', 'порт сервера', process.env.PORT || '3000')
+  .requiredOption('-c, --cache <type>', 'шлях до директорії кешу', process.env.CACHE_DIR || './cache');
 
 program.parse(process.argv);
 
@@ -28,6 +30,18 @@ else
   console.log(`Using existing cache directory: ${CACHE_DIR}`);
 }
 
+const dbClient = new Client({
+  user: process.env.DB_USER || 'postgres',
+  host: process.env.DB_HOST || 'localhost',
+  database: process.env.DB_NAME || 'inventory_db',
+  password: process.env.DB_PASSWORD || 'secret',
+  port: process.env.DB_PORT || 5432,
+});
+
+dbClient.connect()
+  .then(() => console.log('Connected to PostgreSQL database'))
+  .catch(err => console.error('Connection error', err.stack));
+
 const app = express();
 
 app.use(express.static(path.join(__dirname, 'html-forms')));
@@ -39,9 +53,6 @@ const upload = multer({ dest: CACHE_DIR });
 app.use(express.json());
 
 app.use(express.urlencoded({ extended: true }));
-
-let inventory = [];
-let nextId = 1;
 
 /**
  * @swagger
@@ -75,7 +86,7 @@ let nextId = 1;
  *       '400':
  *         description: Bad Request. Не надано 'inventory_name'.
  */
-app.post('/register', upload.single('photo'), (req, res) => {
+app.post('/register', upload.single('photo'),async (req, res) => {
   const { inventory_name, description } = req.body;
   const photo = req.file; 
 
@@ -84,17 +95,24 @@ app.post('/register', upload.single('photo'), (req, res) => {
     return res.status(400).send('Bad Request: inventory_name is required.');
   }
 
-  const newItem = 
-  {
-    id: nextId++,
-    name: inventory_name,
-    description: description || '',
-    photo: photo ? path.resolve(photo.path) : null 
-  };
+const photoPath = photo ? path.resolve(photo.path) : null;
 
-  inventory.push(newItem);
-  console.log('New item registered:', newItem);
-  res.status(201).json(newItem);
+  try 
+  {
+    const query = 'INSERT INTO items (name, description, photo) VALUES ($1, $2, $3) RETURNING *';
+    const values = [inventory_name, description || '', photoPath];
+    
+    const result = await dbClient.query(query, values);
+    const newItem = result.rows[0];
+
+    console.log('New item registered:', newItem);
+    res.status(201).json(newItem);
+  } 
+  catch (err) 
+  {
+    console.error(err);
+    res.status(500).send('Database Error');
+  }
 });
 
 /**
@@ -130,12 +148,23 @@ app.post('/register', upload.single('photo'), (req, res) => {
  *                     type: string
  *                     example: /inventory/1/photo
  */
-app.get('/inventory', (req, res) => {
-  const inventoryWithLinks = inventory.map(item => ({
-    ...item,
-    photo_url: item.photo ? `/inventory/${item.id}/photo` : null
-  }));
-  res.status(200).json(inventoryWithLinks);
+app.get('/inventory', async (req, res) => {
+ try 
+ {
+    const result = await dbClient.query('SELECT * FROM items ORDER BY id ASC');
+    
+    const inventoryWithLinks = result.rows.map(item => ({
+      ...item,
+      photo_url: item.photo ? `/inventory/${item.id}/photo` : null
+    }));
+    
+    res.status(200).json(inventoryWithLinks);
+ }
+ catch (err) 
+ {
+   console.error(err);
+   res.status(500).send('Database Error');
+ }
 });
  
 /**
@@ -158,17 +187,26 @@ app.get('/inventory', (req, res) => {
  *       '404':
  *         description: Not Found. Річ з таким ID не знайдено.
  */
-app.get('/inventory/:id', (req, res) => {
+app.get('/inventory/:id', async (req, res) => {
   const itemId = parseInt(req.params.id, 10);
-  const item = inventory.find(i => i.id === itemId);
+ try 
+ {
+    const result = await dbClient.query('SELECT * FROM items WHERE id = $1', [itemId]);
+    const item = result.rows[0];
 
-  if (!item) 
-  {
-    return res.status(404).send('Not Found');
-  }
+    if (!item) 
+    {
+      return res.status(404).send('Not Found');
+    }
 
-  const itemWithLink = {...item,photo_url: item.photo ? `/inventory/${item.id}/photo` : null};
-  res.status(200).json(itemWithLink);
+    const itemWithLink = { ...item, photo_url: item.photo ? `/inventory/${item.id}/photo` : null };
+    res.status(200).json(itemWithLink);
+ } 
+ catch (err) 
+ {
+   console.error(err);
+   res.status(500).send('Database Error');
+ }
 });
 
 /**
@@ -204,24 +242,33 @@ app.get('/inventory/:id', (req, res) => {
  *       '404':
  *         description: Not Found. Річ з таким ID не знайдено.
  */
-app.put('/inventory/:id', (req, res) => {
+app.put('/inventory/:id', async (req, res) => {
   const itemId = parseInt(req.params.id, 10);
-  const item = inventory.find(i => i.id === itemId);
+  const { name, description } = req.body;
 
-  if (!item) 
+  try 
   {
-    return res.status(404).send('Not Found');
-  }
-  if (req.body.name) 
-  {
-    item.name = req.body.name;
-  }
-  if (req.body.description) 
-  {
-    item.description = req.body.description;
-  }
+    const checkRes = await dbClient.query('SELECT * FROM items WHERE id = $1', [itemId]);
+    if (checkRes.rows.length === 0)
+    {
+      return res.status(404).send('Not Found');
+    }
 
-  res.status(200).json(item);
+    const updateQuery = `
+      UPDATE items 
+      SET name = COALESCE($1, name), description = COALESCE($2, description) 
+      WHERE id = $3 
+      RETURNING *
+    `;
+    const updateRes = await dbClient.query(updateQuery, [name, description, itemId]);
+    
+    res.status(200).json(updateRes.rows[0]);
+  } 
+  catch (err) 
+  {
+    console.error(err);
+    res.status(500).send('Database Error');
+  }
 });
 
 /**
@@ -249,16 +296,26 @@ app.put('/inventory/:id', (req, res) => {
  *       '404':
  *         description: Not Found. Річ або фото не знайдено.
  */
-app.get('/inventory/:id/photo', (req, res) => {
+app.get('/inventory/:id/photo', async (req, res) => {
   const itemId = parseInt(req.params.id, 10);
-  const item = inventory.find(i => i.id === itemId);
-
-  if (!item || !item.photo || !fs.existsSync(item.photo)) 
+  try 
   {
-    return res.status(404).send('Not Found');
+    const result = await dbClient.query('SELECT photo FROM items WHERE id = $1', [itemId]);
+    const item = result.rows[0];
+
+    if (!item || !item.photo || !fs.existsSync(item.photo)) 
+    {
+      return res.status(404).send('Not Found');
+    }
+    
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.sendFile(item.photo);
+  } 
+  catch (err) 
+  {
+    console.error(err);
+    res.status(500).send('Database Error');
   }
-  res.setHeader('Content-Type', 'image/jpeg');
-  res.sendFile(item.photo); 
 });
 
 /**
@@ -294,27 +351,37 @@ app.get('/inventory/:id/photo', (req, res) => {
  *       '404':
  *         description: Not Found. Річ з таким ID не знайдено.
  */
-app.put('/inventory/:id/photo', upload.single('photo'), (req, res) => {
+app.put('/inventory/:id/photo', upload.single('photo'), async (req, res) => {
   const itemId = parseInt(req.params.id, 10);
-  const item = inventory.find(i => i.id === itemId);
 
-  if (!item) 
-  {
-    return res.status(404).send('Not Found');
-  }
+ if (!req.file) 
+ {
+    return res.status(400).send('Bad Request: No photo file provided.');
+ }
 
-  if (req.file) 
+  try 
   {
-    if (item.photo && fs.existsSync(item.photo)) 
+    const checkRes = await dbClient.query('SELECT photo FROM items WHERE id = $1', [itemId]);
+    if (checkRes.rows.length === 0) 
     {
-      fs.unlinkSync(item.photo);
+      return res.status(404).send('Not Found');
     }
-    item.photo = path.resolve(req.file.path); 
+    
+    const oldPhotoPath = checkRes.rows[0].photo;
+    if (oldPhotoPath && fs.existsSync(oldPhotoPath)) 
+    {
+      fs.unlinkSync(oldPhotoPath);
+    }
+
+    const newPhotoPath = path.resolve(req.file.path);
+    await dbClient.query('UPDATE items SET photo = $1 WHERE id = $2', [newPhotoPath, itemId]);
+
     res.status(200).send('Photo updated successfully.');
   } 
-  else 
+  catch (err) 
   {
-    res.status(400).send('Bad Request: No photo file provided.');
+    console.error(err);
+    res.status(500).send('Database Error');
   }
 });
 
@@ -337,22 +404,33 @@ app.put('/inventory/:id/photo', upload.single('photo'), (req, res) => {
  *       '404':
  *         description: Not Found. Річ з таким ID не знайдено.
  */
-app.delete('/inventory/:id', (req, res) => {
+app.delete('/inventory/:id', async (req, res) => {
   const itemId = parseInt(req.params.id, 10);
-  const itemIndex = inventory.findIndex(i => i.id === itemId);
-
-  if (itemIndex === -1) 
+  try 
   {
-    return res.status(404).send('Not Found');
-  }
+    const checkRes = await dbClient.query('SELECT photo FROM items WHERE id = $1', [itemId]);
+    
+    if (checkRes.rows.length === 0) 
+    {
+      return res.status(404).send('Not Found');
+    }
 
-  const [deletedItem] = inventory.splice(itemIndex, 1);
+    const itemToDelete = checkRes.rows[0];
 
-  if (deletedItem.photo && fs.existsSync(deletedItem.photo)) 
+    await dbClient.query('DELETE FROM items WHERE id = $1', [itemId]);
+
+    if (itemToDelete.photo && fs.existsSync(itemToDelete.photo)) 
+    {
+      fs.unlinkSync(itemToDelete.photo);
+    }
+
+    res.status(200).send('Item deleted successfully.');
+  } 
+  catch (err) 
   {
-    fs.unlinkSync(deletedItem.photo);
+    console.error(err);
+    res.status(500).send('Database Error');
   }
-  res.status(200).send('Item deleted successfully.');
 });
 
 /**
@@ -383,24 +461,33 @@ app.delete('/inventory/:id', (req, res) => {
  *       '404':
  *         description: Not Found. Річ з таким ID не знайдено.
  */
-app.post('/search', (req, res) => {
+app.post('/search', async (req, res) => {
   const { id, includePhoto } = req.body; 
   const itemId = parseInt(id, 10);
-  const item = inventory.find(i => i.id === itemId);
+ try 
+ {
+    const result = await dbClient.query('SELECT * FROM items WHERE id = $1', [itemId]);
+    const item = result.rows[0];
 
-  if (!item) 
-  {
-    return res.status(404).send('Not Found');
-  }
+    if (!item) 
+    {
+      return res.status(404).send('Not Found');
+    }
 
-  const result = { ...item };
-  
-  if (includePhoto === 'on' && result.photo) 
-  {
-    result.description += ` [Photo Link: /inventory/${result.id}/photo]`;
-  }
+    const output = { ...item };
+    
+    if (includePhoto === 'on' && output.photo) 
+    {
+      output.description += ` [Photo Link: /inventory/${output.id}/photo]`;
+    }
 
-  res.status(200).json(result);
+    res.status(200).json(output);
+ }
+ catch (err)
+ {
+    console.error(err);
+    res.status(500).send('Database Error');
+ }
 });
 
 const swaggerOptions = {
